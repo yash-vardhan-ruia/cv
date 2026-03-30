@@ -96,16 +96,18 @@ while True:
         # Prepare the Sudoku grid for digit extraction
         sudoku_grid = cv2.copyMakeBorder(sudoku_grid, 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=255)
 
-        # # Split the Sudoku grid into individual cells
-        # cell_size = sudoku_grid.shape[0] // 9
-        # cells = [np.hsplit(row, 9) for row in np.vsplit(sudoku_grid, 9)]
+        # Ensure dimensions are divisible by 9
+        rows, cols = 9, 9
+        grid_height, grid_width = sudoku_grid.shape[:2]
+        
+        # Trim to nearest multiple of 9
+        grid_height = (grid_height // rows) * rows
+        grid_width = (grid_width // cols) * cols
+        sudoku_grid = sudoku_grid[:grid_height, :grid_width]
 
         # Split the Sudoku grid into individual cells
-        rows, cols = 9, 9
-        row_height, col_width = sudoku_grid.shape[:2]
-
-        cell_height = row_height // rows
-        cell_width = col_width // cols
+        cell_height = grid_height // rows
+        cell_width = grid_width // cols
 
         cells = [np.hsplit(row, cols) for row in np.vsplit(sudoku_grid, rows)]
 
