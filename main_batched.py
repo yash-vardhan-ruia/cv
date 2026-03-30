@@ -28,6 +28,7 @@ ABS_DIGIT_CANDIDATE_PROB = 0.03
 RELATIVE_DIGIT_CANDIDATE_RATIO = 0.18
 MAX_DIGIT_CANDIDATES = 5
 SOLUTION_PERSISTENCE_FRAMES = 60
+SOLVE_EVERY_N_FRAMES = 3
 MIN_CORNER_MAX_DRIFT = 2.0
 MAX_CORNER_MAX_DRIFT = 30.0
 CORNER_DRIFT_STEP = 0.5
@@ -312,6 +313,47 @@ def predict_digit_probabilities(cell_binary):
     return stable_softmax(raw_output)
 
 
+def predict_digit_probabilities_batch(prepared_cells):
+    batch_size = len(prepared_cells)
+    if batch_size == 0:
+        return np.zeros((0, 10), dtype=np.float32)
+
+    batch_tensor = np.zeros((batch_size, 1, MODEL_IMAGE_SIZE, MODEL_IMAGE_SIZE), dtype=np.float32)
+    empty_mask = np.zeros(batch_size, dtype=bool)
+
+    for index, prepared in enumerate(prepared_cells):
+        if prepared is None:
+            empty_mask[index] = True
+            continue
+        batch_tensor[index, 0] = prepared.astype(np.float32) / 255.0
+
+    input_tensor = torch.from_numpy(batch_tensor).to(DEVICE)
+
+    with torch.no_grad():
+        logits = DIGIT_NET(input_tensor)
+
+    raw_output = logits.cpu().numpy()
+    if raw_output.ndim != 2:
+        raw_output = raw_output.reshape(batch_size, -1)
+
+    probabilities = np.zeros((batch_size, 10), dtype=np.float32)
+    for index in range(batch_size):
+        if empty_mask[index]:
+            probabilities[index, 0] = 1.0
+            continue
+
+        row = raw_output[index]
+        if row.size != 10:
+            padded = np.zeros(10, dtype=np.float32)
+            usable = min(row.size, 10)
+            padded[:usable] = row[:usable]
+            row = padded
+
+        probabilities[index] = stable_softmax(row)
+
+    return probabilities
+
+
 def smooth_probability_history(history_entries):
     if not history_entries:
         probs = np.zeros(10, dtype=np.float32)
@@ -503,9 +545,12 @@ cached_solution = None
 solution_display_counter = 0
 fps_ema = 0.0
 last_solve_latency_ms = 0.0
+frame_index = 0
+last_solved_signature = None
 
 while True:
     frame_start = time.perf_counter()
+    frame_index += 1
     ret, frame = cap.read()
     if not ret:
         break
@@ -543,6 +588,8 @@ while True:
     warped_binary, gpu_warp_active = warp_binary_for_grid(binary, smoothed_perspective, gpu_pipeline_active)
 
     probability_tensor = np.zeros((9, 9, 10), dtype=np.float32)
+    prepared_cells = []
+    cell_positions = []
 
     for row in range(9):
         for col in range(9):
@@ -551,11 +598,16 @@ while True:
             x1 = col * CELL_SIZE
             x2 = (col + 1) * CELL_SIZE
             cell = warped_binary[y1:y2, x1:x2]
+            prepared_cells.append(preprocess_cell(cell))
+            cell_positions.append((row, col))
 
-            cell_probabilities = predict_digit_probabilities(cell)
-            probability_history[row][col].append(cell_probabilities)
-            smoothed_probabilities = smooth_probability_history(probability_history[row][col])
-            probability_tensor[row, col] = smoothed_probabilities
+    batched_probabilities = predict_digit_probabilities_batch(prepared_cells)
+
+    for index, (row, col) in enumerate(cell_positions):
+        cell_probabilities = batched_probabilities[index]
+        probability_history[row][col].append(cell_probabilities)
+        smoothed_probabilities = smooth_probability_history(probability_history[row][col])
+        probability_tensor[row, col] = smoothed_probabilities
 
     confident_grid, _ = extract_confident_grid(probability_tensor)
     filled_cells = int(np.count_nonzero(confident_grid))
@@ -570,22 +622,29 @@ while True:
 
     if filled_cells >= MIN_CLUES_TO_SOLVE:
         signature = tuple(np.argmax(probability_tensor, axis=2).astype(np.int8).flatten().tolist())
+        signature_changed = signature != previous_signature
+        should_run_solver = (frame_index % SOLVE_EVERY_N_FRAMES == 0) or signature_changed
 
         if signature == previous_signature and cached_solution is not None:
             solved = True
             solved_grid = cached_solution
             solution_display_counter = SOLUTION_PERSISTENCE_FRAMES
             last_solve_latency_ms = 0.0
-        else:
+        elif should_run_solver:
             solve_start = time.perf_counter()
             solved, solved_grid = solve_sudoku_with_probabilities(probability_tensor)
             last_solve_latency_ms = (time.perf_counter() - solve_start) * 1000.0
             if solved:
                 previous_signature = signature
                 cached_solution = solved_grid.copy()
+                last_solved_signature = signature
                 solution_display_counter = SOLUTION_PERSISTENCE_FRAMES
             else:
                 solution_display_counter = max(0, solution_display_counter - 1)
+        elif cached_solution is not None and signature == last_solved_signature:
+            solved = True
+            solved_grid = cached_solution
+            solution_display_counter = max(solution_display_counter, SOLUTION_PERSISTENCE_FRAMES // 2)
     else:
         solution_display_counter = max(0, solution_display_counter - 1)
 
@@ -620,11 +679,11 @@ while True:
                 )
 
     status_color = (0, 255, 0) if valid_clues else (0, 0, 255)
-    status_text = f"Detected Filled Cells Count: {filled_cells} cells"
+    status_text = f"Detected: {filled_cells} cells"
     if not valid_clues:
         status_text += " | clues inconsistent"
     if gpu_warp_active:
-        status_text += " | Using GPU"
+        status_text += " | GPU"
     else:
         status_text += " | CPU"
 
@@ -635,7 +694,10 @@ while True:
     else:
         fps_ema = 0.9 * fps_ema + 0.1 * instant_fps
 
-    metrics_text = f"FPS:{fps_ema:4.1f} | Solve:{last_solve_latency_ms:5.1f}ms | OCR:{average_ocr_confidence:.2f}"
+    metrics_text = (
+        f"FPS:{fps_ema:4.1f} | Solve:{last_solve_latency_ms:5.1f}ms | OCR:{average_ocr_confidence:.2f}"
+        f" | Batch:81"
+    )
     tuning_text = (
         f"Drift:{CORNER_MAX_DRIFT:.1f}px [ ] | Persist:{solution_display_counter}/{SOLUTION_PERSISTENCE_FRAMES} - ="
     )
