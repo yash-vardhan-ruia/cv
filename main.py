@@ -7,17 +7,22 @@ from sklearn.neighbors import KNeighborsClassifier
 GRID_SIZE = 450
 CELL_SIZE = GRID_SIZE // 9
 
-CELL_MARGIN_RATIO = 0.22
-MIN_COMPONENT_AREA_RATIO = 0.03
+CELL_MARGIN_RATIO = 0.16
+MIN_COMPONENT_AREA_RATIO = 0.015
 MIN_COMPONENT_FILL_RATIO = 0.12
-MIN_PREDICTION_CONFIDENCE = 0.70
-MIN_CONFIDENCE_MARGIN = 0.12
+MIN_PREDICTION_CONFIDENCE = 0.58
+MIN_CONFIDENCE_MARGIN = 0.06
 CORNER_SMOOTHING_WINDOW = 5
+DIGIT_SMOOTHING_WINDOW = 5
+MIN_EMPTY_PIXEL_RATIO = 0.03
+MIN_DIGIT_VOTE_SHARE = 0.55
 
 BLUR_KERNEL_SIZE = (7, 7)
 THRESH_BLOCK_SIZE = 11
 THRESH_C = 2
 GRID_OPEN_KERNEL = np.ones((3, 3), dtype=np.uint8)
+CELL_CLEAN_KERNEL = np.ones((2, 2), dtype=np.uint8)
+CLAHE = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
 WARP_DESTINATION = np.array(
     [[0, 0], [GRID_SIZE - 1, 0], [GRID_SIZE - 1, GRID_SIZE - 1], [0, GRID_SIZE - 1]],
@@ -73,7 +78,9 @@ def preprocess_frame(frame, use_gpu):
         try:
             frame_umat = cv2.UMat(frame)
             gray_umat = cv2.cvtColor(frame_umat, cv2.COLOR_BGR2GRAY)
-            blurred_umat = cv2.GaussianBlur(gray_umat, BLUR_KERNEL_SIZE, 0)
+            normalized_gray = CLAHE.apply(gray_umat.get())
+            normalized_gray_umat = cv2.UMat(normalized_gray)
+            blurred_umat = cv2.GaussianBlur(normalized_gray_umat, BLUR_KERNEL_SIZE, 0)
             binary_umat = cv2.adaptiveThreshold(
                 blurred_umat,
                 255,
@@ -82,13 +89,13 @@ def preprocess_frame(frame, use_gpu):
                 THRESH_BLOCK_SIZE,
                 THRESH_C,
             )
-            binary_umat = cv2.morphologyEx(binary_umat, cv2.MORPH_OPEN, GRID_OPEN_KERNEL)
             return gray_umat.get(), binary_umat.get(), True
         except Exception:
             pass
 
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, BLUR_KERNEL_SIZE, 0)
+    normalized_gray = CLAHE.apply(gray)
+    blurred = cv2.GaussianBlur(normalized_gray, BLUR_KERNEL_SIZE, 0)
     binary = cv2.adaptiveThreshold(
         blurred,
         255,
@@ -97,12 +104,12 @@ def preprocess_frame(frame, use_gpu):
         THRESH_BLOCK_SIZE,
         THRESH_C,
     )
-    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, GRID_OPEN_KERNEL)
     return gray, binary, False
 
 
 def find_grid_corners(gray, binary):
-    contours, _ = cv2.findContours(binary.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    binary_for_grid = cv2.morphologyEx(binary, cv2.MORPH_OPEN, GRID_OPEN_KERNEL)
+    contours, _ = cv2.findContours(binary_for_grid, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return None
 
@@ -142,8 +149,11 @@ def preprocess_cell(cell_binary):
     if cropped.size == 0:
         return None
 
-    kernel = np.ones((2, 2), dtype=np.uint8)
-    cropped = cv2.morphologyEx(cropped, cv2.MORPH_OPEN, kernel)
+    raw_fill_ratio = float(np.count_nonzero(cropped)) / float(cropped.size)
+    if raw_fill_ratio < MIN_EMPTY_PIXEL_RATIO:
+        return None
+
+    cropped = cv2.morphologyEx(cropped, cv2.MORPH_CLOSE, CELL_CLEAN_KERNEL)
 
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(cropped, connectivity=8)
     if num_labels <= 1:
@@ -211,7 +221,7 @@ def preprocess_cell(cell_binary):
 def predict_digit(cell_binary):
     prepared = preprocess_cell(cell_binary)
     if prepared is None:
-        return 0
+        return 0, 0.0
 
     sample = cv2.resize(prepared, (8, 8), interpolation=cv2.INTER_AREA).astype(np.float32)
     sample = (sample / 255.0) * 16.0
@@ -224,15 +234,42 @@ def predict_digit(cell_binary):
     runner_up_confidence = float(probabilities[sorted_indices[1]])
 
     if prediction == 0:
-        return 0
+        return 0, 0.0
 
     if confidence < MIN_PREDICTION_CONFIDENCE:
-        return 0
+        return 0, confidence
 
     if (confidence - runner_up_confidence) < MIN_CONFIDENCE_MARGIN:
+        return 0, confidence
+
+    return prediction, confidence
+
+
+def smooth_digit_prediction(history_entries):
+    weighted_votes = np.zeros(10, dtype=np.float32)
+    vote_counts = np.zeros(10, dtype=np.int32)
+
+    for digit, confidence in history_entries:
+        if digit <= 0:
+            continue
+        weight = max(0.05, float(confidence))
+        weighted_votes[digit] += weight
+        vote_counts[digit] += 1
+
+    if float(np.sum(weighted_votes)) <= 0.0:
         return 0
 
-    return prediction
+    best_digit = int(np.argmax(weighted_votes))
+    total_weight = float(np.sum(weighted_votes))
+    best_share = float(weighted_votes[best_digit] / total_weight)
+
+    if best_share < MIN_DIGIT_VOTE_SHARE:
+        return 0
+
+    if len(history_entries) >= 3 and vote_counts[best_digit] < 2:
+        return 0
+
+    return best_digit
 
 
 def solve_sudoku(grid):
@@ -297,6 +334,7 @@ cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
 corner_history = deque(maxlen=CORNER_SMOOTHING_WINDOW)
+digit_history = [[deque(maxlen=DIGIT_SMOOTHING_WINDOW) for _ in range(9)] for _ in range(9)]
 previous_grid = None
 cached_solution = None
 
@@ -309,6 +347,12 @@ while True:
 
     corners = find_grid_corners(gray, binary)
     if corners is None:
+        corner_history.clear()
+        for row in range(9):
+            for col in range(9):
+                digit_history[row][col].clear()
+        previous_grid = None
+        cached_solution = None
         cv2.putText(frame, "Grid not found", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
         cv2.imshow("Real-Time Sudoku Solver", frame)
         if cv2.waitKey(1) & 0xFF == ord("q"):
@@ -330,7 +374,9 @@ while True:
             x1 = col * CELL_SIZE
             x2 = (col + 1) * CELL_SIZE
             cell = warped_binary[y1:y2, x1:x2]
-            sudoku_digits[row, col] = predict_digit(cell)
+            predicted_digit, prediction_confidence = predict_digit(cell)
+            digit_history[row][col].append((predicted_digit, prediction_confidence))
+            sudoku_digits[row, col] = smooth_digit_prediction(digit_history[row][col])
 
     filled_cells = int(np.count_nonzero(sudoku_digits))
     valid_clues = is_valid_initial_grid(sudoku_digits)
@@ -360,17 +406,21 @@ while True:
                         [[[col * CELL_SIZE + CELL_SIZE / 2, row * CELL_SIZE + CELL_SIZE / 2]]], dtype=np.float32
                     )
                     frame_point = cv2.perspectiveTransform(warped_point, inverse_matrix)[0][0]
-                    text_x = int(frame_point[0] - 10)
-                    text_y = int(frame_point[1] + 10)
+                    solved_text = str(int(solved_grid[row, col]))
+                    font_scale = 0.8
+                    thickness = 2
+                    text_size, baseline = cv2.getTextSize(solved_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+                    text_x = int(frame_point[0] - (text_size[0] / 2))
+                    text_y = int(frame_point[1] + (text_size[1] / 2) - baseline)
 
                     cv2.putText(
                         frame,
-                        str(int(solved_grid[row, col])),
+                        solved_text,
                         (text_x, text_y),
                         cv2.FONT_HERSHEY_SIMPLEX,
-                        0.8,
+                        font_scale,
                         (0, 255, 0),
-                        2,
+                        thickness,
                         cv2.LINE_AA,
                     )
     else:
@@ -392,5 +442,5 @@ while True:
     if cv2.waitKey(1) & 0xFF == ord("q"):
         break
 
-cap.release()
+cap.release()   
 cv2.destroyAllWindows()
