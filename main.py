@@ -37,6 +37,30 @@ cap = cv2.VideoCapture(0)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
+
+def build_digit_templates():
+    templates = {digit: [] for digit in range(1, 10)}
+    fonts = [cv2.FONT_HERSHEY_SIMPLEX, cv2.FONT_HERSHEY_DUPLEX, cv2.FONT_HERSHEY_COMPLEX]
+    scales = [0.75, 0.9, 1.0]
+    thicknesses = [2, 3]
+
+    for digit in range(1, 10):
+        text = str(digit)
+        for font in fonts:
+            for scale in scales:
+                for thickness in thicknesses:
+                    canvas = np.zeros((28, 28), dtype=np.uint8)
+                    (text_w, text_h), baseline = cv2.getTextSize(text, font, scale, thickness)
+                    org_x = max(0, (28 - text_w) // 2)
+                    org_y = max(text_h, (28 + text_h) // 2 - baseline // 2)
+                    cv2.putText(canvas, text, (org_x, org_y), font, scale, 255, thickness, cv2.LINE_AA)
+                    _, canvas = cv2.threshold(canvas, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+                    templates[digit].append(canvas)
+    return templates
+
+
+DIGIT_TEMPLATES = build_digit_templates()
+
 def detect_sudoku_grid(processed_frame):
     """Detect and extract the sudoku grid from the processed frame"""
     try:
@@ -45,33 +69,40 @@ def detect_sudoku_grid(processed_frame):
         if len(contours) == 0:
             return None
         
-        # Filter contours by area and aspect ratio to find the sudoku grid
+        # Filter contours by area and shape to find the sudoku grid
         valid_contours = []
+        frame_h, frame_w = processed_frame.shape[:2]
+        min_area = (frame_h * frame_w) * 0.08
+
         for contour in contours:
             area = cv2.contourArea(contour)
-            if area < 5000:  # Minimum area for sudoku grid (lowered threshold)
+            if area < min_area:
                 continue
-            
+
             x, y, w, h = cv2.boundingRect(contour)
             if w == 0 or h == 0:
                 continue
-                
+
             aspect_ratio = float(w) / h
-            
-            # Sudoku grid should be roughly square (0.6 to 1.4 aspect ratio)
-            if 0.6 < aspect_ratio < 1.4:
-                valid_contours.append((contour, area, (x, y, w, h)))
+
+            # Sudoku grid should be roughly square and large
+            if 0.75 < aspect_ratio < 1.25:
+                peri = cv2.arcLength(contour, True)
+                approx = cv2.approxPolyDP(contour, 0.02 * peri, True)
+                valid_contours.append((contour, area, (x, y, w, h), approx))
         
         if not valid_contours:
             return None
         
         # Get the largest valid contour (the sudoku grid)
-        largest_contour, _, (x, y, w, h) = max(valid_contours, key=lambda x: x[1])
+        _, _, (x, y, w, h), _ = max(valid_contours, key=lambda item: item[1])
         
         # Ensure we have valid bounds
         if x >= 0 and y >= 0 and w > 0 and h > 0:
             if y + h <= processed_frame.shape[0] and x + w <= processed_frame.shape[1]:
-                return processed_frame[y:y + h, x:x + w], (x, y, w, h)
+                extracted = processed_frame[y:y + h, x:x + w]
+                if extracted.size > 0:
+                    return extracted, (x, y, w, h)
     
     except Exception as e:
         print(f"Error in detect_sudoku_grid: {e}")
@@ -79,47 +110,56 @@ def detect_sudoku_grid(processed_frame):
     return None
 
 def recognize_digit_template(cell):
-    """Recognize digits using template matching and morphological operations"""
+    """Recognize a Sudoku digit in a cell using contour isolation + template matching"""
     if cell.size == 0:
         return 0
-    
-    # Apply thresholding to get a binary image
-    _, binary = cv2.threshold(cell, 127, 255, cv2.THRESH_BINARY)
-    
-    # Count non-zero pixels
-    non_zero_count = cv2.countNonZero(binary)
-    total_pixels = cell.size
-    fill_ratio = non_zero_count / total_pixels if total_pixels > 0 else 0
-    
-    # If fill ratio is too low, cell is empty
-    if fill_ratio < 0.05:
+
+    h, w = cell.shape[:2]
+    margin = max(3, int(min(h, w) * 0.18))
+    center = cell[margin:h - margin, margin:w - margin]
+    if center.size == 0:
         return 0
+
+    _, binary = cv2.threshold(center, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
     
-    # Use pixel density for digit estimation (1-9)
-    # Normalize to 0-1 range
-    normalized_density = min(1.0, fill_ratio / 0.5)
-    
-    # Map to digit range
-    if fill_ratio < 0.08:
-        return 0  # Empty
-    elif fill_ratio < 0.15:
-        return 1
-    elif fill_ratio < 0.22:
-        return 2
-    elif fill_ratio < 0.29:
-        return 3
-    elif fill_ratio < 0.36:
-        return 4
-    elif fill_ratio < 0.43:
-        return 5
-    elif fill_ratio < 0.50:
-        return 6
-    elif fill_ratio < 0.57:
-        return 7
-    elif fill_ratio < 0.64:
-        return 8
-    else:
-        return 9
+    contours, _ = cv2.findContours(binary.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return 0
+
+    largest = max(contours, key=cv2.contourArea)
+    area = cv2.contourArea(largest)
+    center_area = binary.shape[0] * binary.shape[1]
+    if center_area == 0 or area / center_area < 0.025:
+        return 0
+
+    x, y, bw, bh = cv2.boundingRect(largest)
+    if bw <= 0 or bh <= 0:
+        return 0
+
+    digit_roi = binary[y:y + bh, x:x + bw]
+    digit_28 = np.zeros((28, 28), dtype=np.uint8)
+    scale = min(20.0 / bw, 20.0 / bh)
+    new_w = max(1, int(bw * scale))
+    new_h = max(1, int(bh * scale))
+    resized_digit = cv2.resize(digit_roi, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    offset_x = (28 - new_w) // 2
+    offset_y = (28 - new_h) // 2
+    digit_28[offset_y:offset_y + new_h, offset_x:offset_x + new_w] = resized_digit
+
+    best_digit = 0
+    best_score = -1.0
+    for digit, variants in DIGIT_TEMPLATES.items():
+        for tmpl in variants:
+            score = cv2.matchTemplate(digit_28, tmpl, cv2.TM_CCOEFF_NORMED)[0][0]
+            if score > best_score:
+                best_score = score
+                best_digit = digit
+
+    if best_score < 0.10:
+        return 0
+    return best_digit
 
 def solve_sudoku(grid):
     empty_cell = find_empty_cell(grid)
@@ -187,7 +227,7 @@ while True:
         processed = cv2.GaussianBlur(gray, (9, 9), 0)
     
     # Adaptive thresholding
-    processed = cv2.adaptiveThreshold(processed, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2)
+    processed = cv2.adaptiveThreshold(processed, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 15, 5)
     
     # Detect the sudoku grid
     grid_result = detect_sudoku_grid(processed)
@@ -235,11 +275,8 @@ while True:
             for i in range(9):
                 for j in range(9):
                     cell = cells[i][j]
-                    # Invert so white digits become black for processing
-                    cell_inverted = cv2.bitwise_not(cell)
-                    
                     # Recognize the digit
-                    digit = recognize_digit_template(cell_inverted)
+                    digit = recognize_digit_template(cell)
                     sudoku_digits[i, j] = digit
         except Exception as e:
             print(f"Error recognizing digits: {e}")
