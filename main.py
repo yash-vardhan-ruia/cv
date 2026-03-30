@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 import torch
+import time
 from torch import nn
 from pathlib import Path
 from collections import deque
@@ -27,6 +28,12 @@ ABS_DIGIT_CANDIDATE_PROB = 0.03
 RELATIVE_DIGIT_CANDIDATE_RATIO = 0.18
 MAX_DIGIT_CANDIDATES = 5
 SOLUTION_PERSISTENCE_FRAMES = 60
+MIN_CORNER_MAX_DRIFT = 2.0
+MAX_CORNER_MAX_DRIFT = 30.0
+CORNER_DRIFT_STEP = 0.5
+MIN_PERSISTENCE_FRAMES = 10
+MAX_PERSISTENCE_FRAMES = 300
+PERSISTENCE_STEP_FRAMES = 10
 
 MODEL_ONNX_PATH = Path(__file__).with_name("digit_cnn.pth")
 
@@ -493,10 +500,12 @@ smoothed_corners_anchor = None
 probability_history = [[deque(maxlen=DIGIT_SMOOTHING_WINDOW) for _ in range(9)] for _ in range(9)]
 previous_signature = None
 cached_solution = None
-solution_display_grid = None
 solution_display_counter = 0
+fps_ema = 0.0
+last_solve_latency_ms = 0.0
 
 while True:
+    frame_start = time.perf_counter()
     ret, frame = cap.read()
     if not ret:
         break
@@ -557,6 +566,7 @@ while True:
 
     solved = False
     solved_grid = None
+    average_ocr_confidence = 0.0
 
     if filled_cells >= MIN_CLUES_TO_SOLVE:
         signature = tuple(np.argmax(probability_tensor, axis=2).astype(np.int8).flatten().tolist())
@@ -565,8 +575,11 @@ while True:
             solved = True
             solved_grid = cached_solution
             solution_display_counter = SOLUTION_PERSISTENCE_FRAMES
+            last_solve_latency_ms = 0.0
         else:
+            solve_start = time.perf_counter()
             solved, solved_grid = solve_sudoku_with_probabilities(probability_tensor)
+            last_solve_latency_ms = (time.perf_counter() - solve_start) * 1000.0
             if solved:
                 previous_signature = signature
                 cached_solution = solved_grid.copy()
@@ -575,6 +588,10 @@ while True:
                 solution_display_counter = max(0, solution_display_counter - 1)
     else:
         solution_display_counter = max(0, solution_display_counter - 1)
+
+    if filled_cells > 0:
+        digit_confidence = np.max(probability_tensor[:, :, 1:], axis=2)
+        average_ocr_confidence = float(np.mean(digit_confidence[confident_grid > 0]))
 
     if solution_display_counter > 0 and cached_solution is not None:
         for row in range(9):
@@ -611,11 +628,35 @@ while True:
     else:
         status_text += " | CPU"
 
+    frame_time_ms = (time.perf_counter() - frame_start) * 1000.0
+    instant_fps = 1000.0 / max(frame_time_ms, 1e-6)
+    if fps_ema <= 0.0:
+        fps_ema = instant_fps
+    else:
+        fps_ema = 0.9 * fps_ema + 0.1 * instant_fps
+
+    metrics_text = f"FPS:{fps_ema:4.1f} | Solve:{last_solve_latency_ms:5.1f}ms | OCR:{average_ocr_confidence:.2f}"
+    tuning_text = (
+        f"Drift:{CORNER_MAX_DRIFT:.1f}px [ ] | Persist:{solution_display_counter}/{SOLUTION_PERSISTENCE_FRAMES} - ="
+    )
+
     cv2.putText(frame, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2)
+    cv2.putText(frame, metrics_text, (10, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2)
+    cv2.putText(frame, tuning_text, (10, 84), cv2.FONT_HERSHEY_SIMPLEX, 0.56, (170, 220, 255), 2)
     cv2.imshow("Real-Time Sudoku Solver", frame)
 
-    if cv2.waitKey(1) & 0xFF == ord("q"):
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord("q"):
         break
+    if key == ord("["):
+        CORNER_MAX_DRIFT = max(MIN_CORNER_MAX_DRIFT, CORNER_MAX_DRIFT - CORNER_DRIFT_STEP)
+    elif key == ord("]"):
+        CORNER_MAX_DRIFT = min(MAX_CORNER_MAX_DRIFT, CORNER_MAX_DRIFT + CORNER_DRIFT_STEP)
+    elif key == ord("-"):
+        SOLUTION_PERSISTENCE_FRAMES = max(MIN_PERSISTENCE_FRAMES, SOLUTION_PERSISTENCE_FRAMES - PERSISTENCE_STEP_FRAMES)
+        solution_display_counter = min(solution_display_counter, SOLUTION_PERSISTENCE_FRAMES)
+    elif key == ord("=") or key == ord("+"):
+        SOLUTION_PERSISTENCE_FRAMES = min(MAX_PERSISTENCE_FRAMES, SOLUTION_PERSISTENCE_FRAMES + PERSISTENCE_STEP_FRAMES)
 
 cap.release()
 cv2.destroyAllWindows()
