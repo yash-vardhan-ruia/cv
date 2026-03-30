@@ -165,98 +165,98 @@ def is_safe(grid, row, col, num):
 
     return True
 
-# Rest of the code (video capture and processing) remains the same.
+# Rest of the code (video capture and processing)
 
 while True:
     # Capture frame from video feed
     ret, frame = cap.read()
+    
+    if not ret:
+        break
 
     # Convert the frame to grayscale
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-    # Preprocess the frame
-    processed = cv2.GaussianBlur(gray, (9, 9), 0)
+    # Preprocess the frame with GPU acceleration if available
+    processed = gray.copy()
+    if cv2.cuda.getCudaEnabledDeviceCount() > 0:
+        gpu_gray = cv2.cuda_GpuMat()
+        gpu_gray.upload(gray)
+        gpu_blur = cv2.cuda.createGaussianFilter(cv2.CV_8U, cv2.CV_8U, (9, 9), 1.5).apply(gpu_gray)
+        gpu_blur.download(processed)
+    else:
+        processed = cv2.GaussianBlur(gray, (9, 9), 0)
+    
+    # Adaptive thresholding
     processed = cv2.adaptiveThreshold(processed, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2)
-
-    # Find contours in the processed frame
-    contours, _ = cv2.findContours(processed.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    if len(contours) > 0:
-        # Find the largest contour (presumably the Sudoku grid)
-        largest_contour = max(contours, key=cv2.contourArea)
-
-        # Extract the Sudoku grid from the frame
-        x, y, w, h = cv2.boundingRect(largest_contour)
-        sudoku_grid = processed[y:y + h, x:x + w]
-
-        # # Resize the Sudoku grid to a fixed size (if necessary)
-        # sudoku_grid = cv2.resize(sudoku_grid, (450, 450))
-
-        # Determine the desired size for the Sudoku grid
-        grid_size = 450
-
-        # # Resize the Sudoku grid to a size that can be evenly divided into 9 cells
-        # grid_height, grid_width = sudoku_grid.shape[:2]
-        # resized_height = (grid_height // grid_size) * grid_size
-        # resized_width = (grid_width // grid_size) * grid_size
-        # sudoku_grid = cv2.resize(sudoku_grid, (resized_width, resized_height))
-
-        # Resize the Sudoku grid to a size that can be evenly divided into 9 cells
+    
+    # Detect the sudoku grid
+    grid_result = detect_sudoku_grid(processed)
+    
+    if grid_result is not None:
+        sudoku_grid, (grid_x, grid_y, grid_w, grid_h) = grid_result
+        
+        # Resize the sudoku grid to a standard size
+        target_size = 450
         grid_height, grid_width = sudoku_grid.shape[:2]
-        resized_height = int(grid_height / grid_size) * grid_size
-        resized_width = int(grid_width / grid_size) * grid_size
-        # sudoku_grid = cv2.resize(sudoku_grid, (resized_width, resized_height), interpolation=cv2.INTER_AREA)
-        if resized_width > 0 and resized_height > 0:
-            sudoku_grid = cv2.resize(sudoku_grid, (resized_width, resized_height), interpolation=cv2.INTER_AREA)
+        scale = min(target_size / grid_width, target_size / grid_height)
+        
+        new_width = int(grid_width * scale)
+        new_height = int(grid_height * scale)
+        
+        # Make dimensions divisible by 9
+        new_width = (new_width // 9) * 9
+        new_height = (new_height // 9) * 9
+        
+        if new_width > 0 and new_height > 0:
+            sudoku_grid = cv2.resize(sudoku_grid, (new_width, new_height), interpolation=cv2.INTER_AREA)
         else:
             continue
-
-
-
-        # Prepare the Sudoku grid for digit extraction
-        sudoku_grid = cv2.copyMakeBorder(sudoku_grid, 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=255)
-
-        # Ensure dimensions are divisible by 9
-        rows, cols = 9, 9
-        grid_height, grid_width = sudoku_grid.shape[:2]
         
-        # Trim to nearest multiple of 9
-        grid_height = (grid_height // rows) * rows
-        grid_width = (grid_width // cols) * cols
-        sudoku_grid = sudoku_grid[:grid_height, :grid_width]
-
-        # Split the Sudoku grid into individual cells
-        cell_height = grid_height // rows
-        cell_width = grid_width // cols
-
+        # Split the sudoku grid into 9x9 cells
+        rows, cols = 9, 9
+        cell_height = new_height // rows
+        cell_width = new_width // cols
+        
         cells = [np.hsplit(row, cols) for row in np.vsplit(sudoku_grid, rows)]
-
-
-        # Initialize an empty grid to store the Sudoku digits
+        
+        # Initialize grid to store recognized digits
         sudoku_digits = np.zeros((9, 9), dtype=int)
-
-        # Extract and recognize digits in each cell of the Sudoku grid
+        
+        # Extract and recognize digits in each cell
         for i in range(9):
             for j in range(9):
                 cell = cells[i][j]
-                cell = cv2.bitwise_not(cell)  # Invert the cell to make digits black
+                # Invert so white digits become black for processing
+                cell_inverted = cv2.bitwise_not(cell)
                 
-                # Perform digit recognition on the cell
-                digit = recognize_digit(cell)
+                # Recognize the digit
+                digit = recognize_digit_template(cell_inverted)
                 sudoku_digits[i, j] = digit
-
-        # Solve the Sudoku puzzle
-        solve_sudoku(sudoku_digits)
-
-        # Overlay the solution on the frame
-        cell_size = frame.shape[0] // 9
-        for i in range(9):
-            for j in range(9):
-                digit = sudoku_digits[i, j]
-                if digit != 0:
-                    cell_x = x + j * cell_size
-                    cell_y = y + i * cell_size
-                    cv2.putText(frame, str(digit), (cell_x + 30, cell_y + 60), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 0), 3)
+        
+        # Only solve if grid has enough filled cells
+        filled_cells = np.count_nonzero(sudoku_digits)
+        if filled_cells > 17:  # Valid sudoku typically has at least 17 clues
+            # Make a copy for solving
+            grid_copy = sudoku_digits.copy()
+            solve_sudoku(grid_copy)
+            
+            # Overlay the solution on the frame
+            for i in range(9):
+                for j in range(9):
+                    if sudoku_digits[i, j] == 0 and grid_copy[i, j] != 0:
+                        # This is a solved cell (was empty before)
+                        cell_x = grid_x + j * cell_width + cell_width // 2
+                        cell_y = grid_y + i * cell_height + cell_height // 2
+                        cv2.putText(frame, str(grid_copy[i, j]), (cell_x - 15, cell_y + 15), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        
+        # Draw the grid boundaries for visualization
+        cv2.rectangle(frame, (grid_x, grid_y), (grid_x + grid_w, grid_y + grid_h), (255, 0, 0), 2)
+        
+        # Display detected grid information
+        cv2.putText(frame, f"Detected: {filled_cells} cells", (10, 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
     # Display the frame
     cv2.imshow('Real-Time Sudoku Solver', frame)
