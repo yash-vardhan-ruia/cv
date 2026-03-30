@@ -14,6 +14,11 @@ MIN_PREDICTION_CONFIDENCE = 0.70
 MIN_CONFIDENCE_MARGIN = 0.12
 CORNER_SMOOTHING_WINDOW = 5
 
+BLUR_KERNEL_SIZE = (7, 7)
+THRESH_BLOCK_SIZE = 11
+THRESH_C = 2
+GRID_OPEN_KERNEL = np.ones((3, 3), dtype=np.uint8)
+
 WARP_DESTINATION = np.array(
     [[0, 0], [GRID_SIZE - 1, 0], [GRID_SIZE - 1, GRID_SIZE - 1], [0, GRID_SIZE - 1]],
     dtype="float32",
@@ -63,7 +68,40 @@ def order_points(points):
     return rect
 
 
-def find_and_warp_grid(gray, binary):
+def preprocess_frame(frame, use_gpu):
+    if use_gpu:
+        try:
+            frame_umat = cv2.UMat(frame)
+            gray_umat = cv2.cvtColor(frame_umat, cv2.COLOR_BGR2GRAY)
+            blurred_umat = cv2.GaussianBlur(gray_umat, BLUR_KERNEL_SIZE, 0)
+            binary_umat = cv2.adaptiveThreshold(
+                blurred_umat,
+                255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY_INV,
+                THRESH_BLOCK_SIZE,
+                THRESH_C,
+            )
+            binary_umat = cv2.morphologyEx(binary_umat, cv2.MORPH_OPEN, GRID_OPEN_KERNEL)
+            return gray_umat.get(), binary_umat.get(), True
+        except Exception:
+            pass
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, BLUR_KERNEL_SIZE, 0)
+    binary = cv2.adaptiveThreshold(
+        blurred,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        THRESH_BLOCK_SIZE,
+        THRESH_C,
+    )
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, GRID_OPEN_KERNEL)
+    return gray, binary, False
+
+
+def find_grid_corners(gray, binary):
     contours, _ = cv2.findContours(binary.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return None
@@ -83,15 +121,19 @@ def find_and_warp_grid(gray, binary):
 
         points = approximation.reshape(4, 2).astype("float32")
         ordered = order_points(points)
-
-        perspective_matrix = cv2.getPerspectiveTransform(ordered, WARP_DESTINATION)
-        inverse_matrix = cv2.getPerspectiveTransform(WARP_DESTINATION, ordered)
-
-        warped_gray = cv2.warpPerspective(gray, perspective_matrix, (GRID_SIZE, GRID_SIZE))
-        warped_binary = cv2.warpPerspective(binary, perspective_matrix, (GRID_SIZE, GRID_SIZE))
-        return warped_gray, warped_binary, ordered, inverse_matrix
+        return ordered
 
     return None
+
+
+def warp_binary_for_grid(binary, perspective_matrix, use_gpu):
+    if use_gpu:
+        try:
+            return cv2.warpPerspective(cv2.UMat(binary), perspective_matrix, (GRID_SIZE, GRID_SIZE)).get(), True
+        except Exception:
+            pass
+
+    return cv2.warpPerspective(binary, perspective_matrix, (GRID_SIZE, GRID_SIZE)), False
 
 
 def preprocess_cell(cell_binary):
@@ -263,34 +305,21 @@ while True:
     if not ret:
         break
 
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    gray, binary, gpu_pipeline_active = preprocess_frame(frame, gpu_available)
 
-    if gpu_available:
-        try:
-            gray_umat = cv2.UMat(gray)
-            blurred = cv2.GaussianBlur(gray_umat, (7, 7), 0).get()
-        except Exception:
-            blurred = cv2.GaussianBlur(gray, (7, 7), 0)
-    else:
-        blurred = cv2.GaussianBlur(gray, (7, 7), 0)
-
-    binary = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2)
-
-    warped_result = find_and_warp_grid(gray, binary)
-    if warped_result is None:
+    corners = find_grid_corners(gray, binary)
+    if corners is None:
         cv2.putText(frame, "Grid not found", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
         cv2.imshow("Real-Time Sudoku Solver", frame)
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
         continue
 
-    _, warped_binary, corners, _ = warped_result
-
     corner_history.append(corners)
     smoothed_corners = np.mean(np.array(corner_history), axis=0).astype(np.float32)
     smoothed_perspective = cv2.getPerspectiveTransform(smoothed_corners, WARP_DESTINATION)
     inverse_matrix = cv2.getPerspectiveTransform(WARP_DESTINATION, smoothed_corners)
-    warped_binary = cv2.warpPerspective(binary, smoothed_perspective, (GRID_SIZE, GRID_SIZE))
+    warped_binary, gpu_warp_active = warp_binary_for_grid(binary, smoothed_perspective, gpu_pipeline_active)
 
     sudoku_digits = np.zeros((9, 9), dtype=int)
 
@@ -352,6 +381,10 @@ while True:
     status_text = f"Detected: {filled_cells} cells"
     if not valid_clues:
         status_text += " | invalid clues"
+    if gpu_warp_active:
+        status_text += " | GPU"
+    else:
+        status_text += " | CPU"
 
     cv2.putText(frame, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, status_color, 2)
     cv2.imshow("Real-Time Sudoku Solver", frame)
