@@ -13,7 +13,8 @@ MIN_COMPONENT_AREA_RATIO = 0.015
 MIN_COMPONENT_FILL_RATIO = 0.12
 MIN_PREDICTION_CONFIDENCE = 0.58
 MIN_CONFIDENCE_MARGIN = 0.06
-CORNER_SMOOTHING_WINDOW = 5
+CORNER_SMOOTHING_WINDOW = 25
+CORNER_MAX_DRIFT = 15.0
 DIGIT_SMOOTHING_WINDOW = 5
 MIN_EMPTY_PIXEL_RATIO = 0.03
 TEMPORAL_DECAY = 0.72
@@ -116,6 +117,14 @@ def order_points(points):
     rect[1] = points[np.argmin(diffs)]
     rect[3] = points[np.argmax(diffs)]
     return rect
+
+
+def corners_distance(corners1, corners2):
+    """Compute max Euclidean distance between corresponding corners."""
+    if corners1 is None or corners2 is None:
+        return float("inf")
+    dists = np.linalg.norm(corners1 - corners2, axis=1)
+    return float(np.max(dists))
 
 
 def preprocess_frame(frame, use_gpu):
@@ -479,6 +488,7 @@ cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
 corner_history = deque(maxlen=CORNER_SMOOTHING_WINDOW)
+smoothed_corners_anchor = None
 probability_history = [[deque(maxlen=DIGIT_SMOOTHING_WINDOW) for _ in range(9)] for _ in range(9)]
 previous_signature = None
 cached_solution = None
@@ -493,6 +503,7 @@ while True:
     corners = find_grid_corners(gray, binary)
     if corners is None:
         corner_history.clear()
+        smoothed_corners_anchor = None
         for row in range(9):
             for col in range(9):
                 probability_history[row][col].clear()
@@ -504,8 +515,16 @@ while True:
             break
         continue
 
-    corner_history.append(corners)
-    smoothed_corners = np.mean(np.array(corner_history), axis=0).astype(np.float32)
+    smoothed_corners_candidate = np.mean(np.array(corner_history), axis=0).astype(np.float32) if corner_history else None
+    drift = corners_distance(corners, smoothed_corners_candidate)
+    
+    if drift <= CORNER_MAX_DRIFT or len(corner_history) == 0:
+        corner_history.append(corners)
+        smoothed_corners = np.mean(np.array(corner_history), axis=0).astype(np.float32)
+        smoothed_corners_anchor = smoothed_corners
+    else:
+        smoothed_corners = smoothed_corners_anchor if smoothed_corners_anchor is not None else np.mean(np.array(corner_history), axis=0).astype(np.float32)
+    
     smoothed_perspective = cv2.getPerspectiveTransform(smoothed_corners, WARP_DESTINATION)
     inverse_matrix = cv2.getPerspectiveTransform(WARP_DESTINATION, smoothed_corners)
     warped_binary, gpu_warp_active = warp_binary_for_grid(binary, smoothed_perspective, gpu_pipeline_active)
