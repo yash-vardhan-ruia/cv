@@ -10,7 +10,7 @@ The project includes offline training and two real-time inference pipelines.
 
 # Demo
 ![Poject Demo Showing a Expert level Sudoku Being Solved](demo.png)
-![Poject Demo Showing a easy level Sudoku Being Solved](demo2.png)
+![Poject Demo Showing a easy level Sudoku Being Solved](demo_2.png)
 
 ## Features
 
