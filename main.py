@@ -647,16 +647,7 @@ while True:
 
     key = cv2.waitKey(1) & 0xFF
     if key == ord("q"):
+        print("Exiting...")
         break
-    if key == ord("["):
-        CORNER_MAX_DRIFT = max(MIN_CORNER_MAX_DRIFT, CORNER_MAX_DRIFT - CORNER_DRIFT_STEP)
-    elif key == ord("]"):
-        CORNER_MAX_DRIFT = min(MAX_CORNER_MAX_DRIFT, CORNER_MAX_DRIFT + CORNER_DRIFT_STEP)
-    elif key == ord("-"):
-        SOLUTION_PERSISTENCE_FRAMES = max(MIN_PERSISTENCE_FRAMES, SOLUTION_PERSISTENCE_FRAMES - PERSISTENCE_STEP_FRAMES)
-        solution_display_counter = min(solution_display_counter, SOLUTION_PERSISTENCE_FRAMES)
-    elif key == ord("=") or key == ord("+"):
-        SOLUTION_PERSISTENCE_FRAMES = min(MAX_PERSISTENCE_FRAMES, SOLUTION_PERSISTENCE_FRAMES + PERSISTENCE_STEP_FRAMES)
-
 cap.release()
 cv2.destroyAllWindows()
