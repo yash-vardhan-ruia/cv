@@ -7,6 +7,7 @@ Real-time Sudoku detection and solving from webcam video using:
 - Probability-guided Sudoku backtracking instead of hard OCR-only clues
 
 The project includes offline training and two real-time inference pipelines.
+![Poject Demo Showing a Expert level Sudoku Being Solved](demo.png)
 
 ## Features
 
